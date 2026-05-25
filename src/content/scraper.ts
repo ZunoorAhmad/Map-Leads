@@ -7,10 +7,54 @@ import type {
 const RESULT_CARD_SELECTOR = 'div[role="article"], [role="listitem"], .Nv2PK, .section-result, [data-result-id]'
 const DETAILS_WAIT_TIMEOUT_MS = 2200
 const SCROLL_SETTLE_MS = 180
+const CLICK_SETTLE_MS = 500
+const CLICK_RETRY_DELAYS_MS = [500, 1000]
 const DETAIL_POLL_INTERVAL_MS = 80
 
-function logScrape(...args: unknown[]) {
-  console.log('[map-leads]', ...args)
+type DelayLogEntry = {
+  batch: number
+  durationMs: number
+  loaderDetected: boolean
+  visibleBefore: number
+  visibleAfter: number
+}
+
+type ScrapeRunStats = {
+  startTimeMs: number
+  acceptedCount: number
+  duplicateCount: number
+  failedOpenCount: number
+  delayEntries: DelayLogEntry[]
+  lastAcceptedName: string
+  lastAcceptedIndex: number
+}
+
+function logScrape(event: string, details?: unknown) {
+  if (typeof details === 'undefined') {
+    console.log('[map-leads]', event)
+    return
+  }
+
+  console.log('[map-leads]', event, details)
+}
+
+function summarizeRunStats(stats: ScrapeRunStats, totalResults: number) {
+  const elapsedMs = Date.now() - stats.startTimeMs
+  const totalDelayMs = stats.delayEntries.reduce((sum, entry) => sum + entry.durationMs, 0)
+
+  console.log('[map-leads] scrape summary', {
+    totalElapsedMs: elapsedMs,
+    totalElapsedSeconds: Number((elapsedMs / 1000).toFixed(2)),
+    totalRecords: totalResults,
+    acceptedRecords: stats.acceptedCount,
+    duplicatesRemoved: stats.duplicateCount,
+    failedOpens: stats.failedOpenCount,
+    delayCount: stats.delayEntries.length,
+    totalDelayMs,
+    delayEvents: stats.delayEntries,
+    lastScrapedRecord: stats.lastAcceptedName,
+    lastScrapedIndex: stats.lastAcceptedIndex,
+  })
 }
 
 function sleep(ms: number) {
@@ -50,7 +94,11 @@ function qHref(el: ParentNode | null, selectors: string[]) {
 }
 
 function normalize(text: string) {
-  return text.replace(/\s+/g, ' ').trim()
+  return text
+    .replace(/[\uE000-\uF8FF]/g, '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 function extractSearchPageCards() {
@@ -171,20 +219,20 @@ function collectVisibleCardDescriptors() {
   })
 }
 
-async function waitForFeedStability(timeout = 1200) {
+async function waitForFeedStability(batch: number, timeout = 7000): Promise<DelayLogEntry> {
   const start = Date.now()
   let lastCount = collectVisibleCardDescriptors().length
   let stableChecks = 0
   let loaderLogged = false
+  const visibleBefore = lastCount
 
   while (Date.now() - start < timeout) {
     // detect loader-like elements
     const loader = document.querySelector('[role="progressbar"], .section-loading, [aria-busy="true"], .m6QErb .section-loading')
     if (loader && !loaderLogged) {
       loaderLogged = true
-      logScrape('loader detected — awaiting feed to settle')
-      const snapshot = collectVisibleCardDescriptors().slice(0, 30).map(d => ({ identity: d.identity, title: d.title }))
-      logScrape('cards at loader time (sample)', snapshot)
+      const snapshot = collectVisibleCardDescriptors().slice(0, 15).map(d => ({ identity: d.identity, title: d.title }))
+      logScrape('loader detected', { batch, visibleBefore, sample: snapshot })
     }
 
     await sleep(150)
@@ -196,15 +244,27 @@ async function waitForFeedStability(timeout = 1200) {
       lastCount = nowCount
     }
 
-    // consider stable after two consecutive equal counts
-    if (stableChecks >= 2) {
-      const finalSnapshot = collectVisibleCardDescriptors().slice(0, 40).map(d => ({ identity: d.identity, title: d.title }))
-      logScrape('feed settled', { visibleCount: finalSnapshot.length, sample: finalSnapshot })
-      return
+    // consider stable after three consecutive equal counts
+    if (stableChecks >= 3) {
+      const visibleAfter = collectVisibleCardDescriptors().length
+      return {
+        batch,
+        durationMs: Date.now() - start,
+        loaderDetected: loaderLogged,
+        visibleBefore,
+        visibleAfter,
+      }
     }
   }
 
-  logScrape('feed stability wait timed out', { elapsedMs: Date.now() - start, lastVisibleCount: lastCount })
+  const visibleAfter = collectVisibleCardDescriptors().length
+  return {
+    batch,
+    durationMs: Date.now() - start,
+    loaderDetected: loaderLogged,
+    visibleBefore,
+    visibleAfter: Math.max(visibleAfter, lastCount),
+  }
 }
 
 function getDetailPaneRoot() {
@@ -330,7 +390,7 @@ function extractPlaceDetailsFromPane(): ScrapedGoogleMapsData {
   }
 }
 
-async function waitForDetailReady(previousSignature: string, expectedTitle: string) {
+async function waitForDetailReady(previousSignature: string) {
   const start = Date.now()
   const importantSelectors = [
     'button[data-item-id="address"]',
@@ -346,44 +406,31 @@ async function waitForDetailReady(previousSignature: string, expectedTitle: stri
     const nextSignature = getPlaceSignature(root)
     const hasImportantSelector = importantSelectors.some(sel => Boolean(root.querySelector(sel)))
     if (isRealPlaceName(nextName) && nextSignature !== previousSignature && hasImportantSelector) {
-      logScrape('detail ready', {
-        expectedTitle,
-        nextName,
-        elapsedMs: Date.now() - start,
-        nextSignature,
-      })
       return true
     }
 
     if (isRealPlaceName(nextName) && nextAddress && hasImportantSelector && nextSignature !== previousSignature) {
-      logScrape('detail ready via address', {
-        expectedTitle,
-        nextName,
-        elapsedMs: Date.now() - start,
-        nextSignature,
-      })
       return true
     }
 
     await sleep(DETAIL_POLL_INTERVAL_MS)
   }
 
-  logScrape('detail wait timed out', {
-    expectedTitle,
-    previousSignature,
-    elapsedMs: Date.now() - start,
-  })
   return false
 }
 
-async function clickCardAndScrape(card: HTMLElement, expectedTitle: string) {
+async function clickCardAndScrape(card: HTMLElement) {
   const clickTarget = card.querySelector<HTMLElement>('a[href], button, div[role="button"]') ?? card
-  const maxAttempts = 1
+  const maxAttempts = 3
 
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (attempt > 0) {
+      const retryDelayMs = CLICK_RETRY_DELAYS_MS[attempt - 1] ?? CLICK_RETRY_DELAYS_MS[CLICK_RETRY_DELAYS_MS.length - 1]
+      logScrape('retrying same card', { attempt: attempt + 1, retryDelayMs })
+      await sleep(retryDelayMs)
+    }
+
     const beforeSignature = getPlaceSignature(getDetailPaneRoot())
-    const start = Date.now()
-    logScrape('click attempt start', { attempt: attempt + 1, expectedTitle, beforeSignature })
     card.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior })
     await sleep(50)
 
@@ -394,11 +441,10 @@ async function clickCardAndScrape(card: HTMLElement, expectedTitle: string) {
       clickTarget.dispatchEvent(evt)
     }
 
-    logScrape('click dispatched', { attempt: attempt + 1, expectedTitle })
+    await sleep(CLICK_SETTLE_MS)
 
-    const opened = await waitForDetailReady(beforeSignature, expectedTitle)
+    const opened = await waitForDetailReady(beforeSignature)
     if (!opened) {
-      logScrape('retrying click', { attempt: attempt + 1, expectedTitle, elapsedMs: Date.now() - start })
       continue
     }
 
@@ -406,14 +452,6 @@ async function clickCardAndScrape(card: HTMLElement, expectedTitle: string) {
 
     const details = extractPlaceDetailsFromPane()
     const currentSignature = getPlaceSignature(getDetailPaneRoot())
-
-    logScrape('scraped row', {
-      attempt: attempt + 1,
-      expectedTitle,
-      currentName: details.name,
-      currentSignature,
-      elapsedMs: Date.now() - start,
-    })
 
     if (isRealPlaceName(details.name) && currentSignature !== beforeSignature) {
       if (!details.website) {
@@ -432,6 +470,15 @@ async function scrapeAllLoadedRecords(limit?: number | null) {
   const seen = new Set<string>()
   const scrapedSignatures = new Set<string>()
   const container = getResultsContainer()
+  const stats: ScrapeRunStats = {
+    startTimeMs: Date.now(),
+    acceptedCount: 0,
+    duplicateCount: 0,
+    failedOpenCount: 0,
+    delayEntries: [],
+    lastAcceptedName: '',
+    lastAcceptedIndex: 0,
+  }
 
   if (!container) {
     return results
@@ -443,35 +490,38 @@ async function scrapeAllLoadedRecords(limit?: number | null) {
 
   for (let i = 0; i < 200; i += 1) {
     const visibleCards = collectVisibleCardDescriptors()
-    logScrape('visible cards batch', { batch: i + 1, visibleCount: visibleCards.length, seenCardCount: seen.size, uniquePlacesCount: scrapedSignatures.size, resultsCount: results.length })
 
     for (const { identity, title, card } of visibleCards) {
       if (seen.has(identity)) {
         continue
       }
 
-      seen.add(identity)
-
       if (typeof limit === 'number' && limit > 0 && results.length >= limit) {
         return results
       }
 
       try {
-        const row = await clickCardAndScrape(card, title)
+        const row = await clickCardAndScrape(card)
         if (row.name && isRealPlaceName(row.name)) {
           const actualSignature = `${row.name}||${row.address}||${row.phone}`
+          seen.add(identity)
           
           if (scrapedSignatures.has(actualSignature)) {
-            logScrape('row skipped - duplicate signature', { title, rowName: row.name, existingCount: results.length })
+            stats.duplicateCount += 1
+            logScrape('duplicate removed', { title, rowName: row.name, duplicateCount: stats.duplicateCount, resultsCount: results.length })
             continue
           }
           
           scrapedSignatures.add(actualSignature)
           results.push(row)
-          logScrape('row accepted', { title, rowName: row.name, resultsCount: results.length })
+          stats.acceptedCount += 1
+          stats.lastAcceptedName = row.name
+          stats.lastAcceptedIndex = results.length
+          logScrape('row accepted', { index: results.length, title, rowName: row.name })
         }
       } catch {
-        logScrape('row skipped after failed open', { title })
+        stats.failedOpenCount += 1
+        logScrape('row skipped after failed open', { title, failedOpenCount: stats.failedOpenCount })
         continue
       }
     }
@@ -481,7 +531,20 @@ async function scrapeAllLoadedRecords(limit?: number | null) {
     await sleep(SCROLL_SETTLE_MS)
     // Wait for feed to stabilize after loader/virtual scroll re-render
     try {
-      await waitForFeedStability()
+      const delayEntry = await waitForFeedStability(i + 1, 7000)
+      stats.delayEntries.push(delayEntry)
+
+      const firstVisible = collectVisibleCardDescriptors()[0]?.title ?? ''
+      logScrape('loader delay', {
+        delayNumber: stats.delayEntries.length,
+        batch: delayEntry.batch,
+        durationMs: delayEntry.durationMs,
+        loaderDetected: delayEntry.loaderDetected,
+        visibleBefore: delayEntry.visibleBefore,
+        visibleAfter: delayEntry.visibleAfter,
+        lastScrapedRecord: stats.lastAcceptedName,
+        firstVisibleAfterLoad: firstVisible,
+      })
     } catch (e) {
       // swallow - waitForFeedStability logs internally on timeout
     }
@@ -510,7 +573,7 @@ async function scrapeAllLoadedRecords(limit?: number | null) {
     }
   }
 
-  logScrape('scrape finished', { resultsCount: results.length, uniquePlacesCount: scrapedSignatures.size, seenCardIdentities: seen.size })
+  summarizeRunStats(stats, results.length)
   return results
 }
 
