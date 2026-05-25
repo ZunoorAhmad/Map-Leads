@@ -1,10 +1,15 @@
-import { useMemo, useState } from 'react'
-import type { ScrapeResponse, ScrapedGoogleMapsData } from '../types'
+import { useEffect, useMemo, useState } from 'react'
+import type {
+  GoogleMapsScrapeJobState,
+  RuntimeResponse,
+  ScrapedGoogleMapsData,
+  StartBatchScrapeMessage,
+} from '../types'
 import { postScrapedData } from '../utils/api'
 import { downloadJson } from '../utils/download'
 import './popup.css'
 
-type ActionState = 'idle' | 'loading-scrape' | 'loading-download' | 'loading-api'
+type ActionState = 'idle' | 'loading-start' | 'loading-download' | 'loading-api'
 
 type StatusState =
   | {
@@ -14,6 +19,8 @@ type StatusState =
   | null
 
 type ScrapedArray = ScrapedGoogleMapsData[]
+
+const JOB_STORAGE_KEY = 'map-leads-scrape-job'
 
 function isGoogleMapsUrl(url?: string) {
   if (!url) {
@@ -31,42 +38,6 @@ function isGoogleMapsUrl(url?: string) {
   }
 }
 
-function extractSearchFromUrl(url?: string) {
-  if (!url) {
-    return ''
-  }
-
-  try {
-    const parsedUrl = new URL(url)
-    const pathname = parsedUrl.pathname
-
-    // Pattern: /maps/search/{query} or /maps/search/{query}/{more}
-    const match = pathname.match(/\/maps\/search\/([^/@?]+)/)
-    if (match && match[1]) {
-      const encoded = match[1]
-      // Decode URI component and replace + with space
-      const decoded = decodeURIComponent(encoded).replace(/\+/g, ' ')
-      return decoded
-    }
-  } catch {}
-
-  return ''
-}
-
-function sanitizeLimit(value: string) {
-  const trimmed = value.trim()
-
-  if (!trimmed) {
-    return null
-  }
-
-  const parsed = Number.parseInt(trimmed, 10)
-
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
-}
-
-
-
 function queryActiveTab() {
   return new Promise<{ id: number; url?: string }>((resolve, reject) => {
     chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
@@ -82,27 +53,34 @@ function queryActiveTab() {
   })
 }
 
-function requestScrape(tabId: number, limit: number | null) {
-  return new Promise<ScrapeResponse>((resolve, reject) => {
-    let responded = false
-    
-    // Set a generous timeout for long-running scrapes (15 minutes max)
-    const timeoutId = window.setTimeout(() => {
-      if (!responded) {
-        responded = true
-        reject(new Error('Scraping took too long (15+ minutes). The connection was lost. Try again, keeping the page active and visible.'))
+function parseQueriesText(value: string) {
+  return value
+    .split(/[\n,]/)
+    .map(query => query.trim())
+    .filter(Boolean)
+}
+
+function readSessionJobState() {
+  return new Promise<GoogleMapsScrapeJobState | null>(resolve => {
+    chrome.storage.local.get(JOB_STORAGE_KEY, items => {
+      if (chrome.runtime.lastError) {
+        resolve(null)
+        return
       }
-    }, 15 * 60 * 1000)
 
-    chrome.tabs.sendMessage(tabId, { type: 'SCRIPT_START_SCRAPE', limit }, response => {
-      if (responded) return
-      responded = true
-      clearTimeout(timeoutId)
+      const state = items[JOB_STORAGE_KEY] as GoogleMapsScrapeJobState | undefined
+      resolve(state ?? null)
+    })
+  })
+}
 
+function requestStartBatch(tabId: number, message: StartBatchScrapeMessage) {
+  return new Promise<RuntimeResponse>((resolve, reject) => {
+    chrome.tabs.sendMessage(tabId, message, response => {
       if (chrome.runtime.lastError) {
         const errorMsg = chrome.runtime.lastError.message || ''
         if (errorMsg.includes('back/forward cache') || errorMsg.includes('port')) {
-          reject(new Error('The page was moved or refreshed before scraping could complete. Make sure the Maps tab stays active during scraping and avoid clicking or navigating. Try again.'))
+          reject(new Error('The page was moved or refreshed before automation could start. Keep the Maps tab active and visible, then try again.'))
         } else {
           reject(new Error(errorMsg || 'Content script is not available.'))
         }
@@ -110,27 +88,85 @@ function requestScrape(tabId: number, limit: number | null) {
       }
 
       if (!response) {
-        reject(new Error('The page did not return any scrape data.'))
+        reject(new Error('The page did not confirm the automation start.'))
         return
       }
 
-      resolve(response)
+      resolve(response as RuntimeResponse)
     })
   })
+}
+
+function applyJobState(state: GoogleMapsScrapeJobState | null) {
+  return {
+    sheetName: state?.sheetName ?? '',
+    queriesText: state?.queries.join('\n') ?? '',
+    scrapedData: state?.results?.length ? state.results : null,
+  }
 }
 
 export function Popup() {
   const [actionState, setActionState] = useState<ActionState>('idle')
   const [status, setStatus] = useState<StatusState>(null)
+  const [jobState, setJobState] = useState<GoogleMapsScrapeJobState | null>(null)
   const [scrapedData, setScrapedData] = useState<ScrapedArray | null>(null)
-  const [searchQuery, setSearchQuery] = useState<string>('')
-  const [limitInput, setLimitInput] = useState<string>('')
+  const [sheetName, setSheetName] = useState<string>('')
+  const [queriesText, setQueriesText] = useState<string>('')
 
-  const recordLimit = useMemo(() => sanitizeLimit(limitInput), [limitInput])
+  const parsedQueries = useMemo(() => parseQueriesText(queriesText), [queriesText])
+  const isRunning = jobState?.status === 'running'
+  const hasCompletedData = Boolean(scrapedData?.length)
+  const activeSheetName = sheetName.trim() || jobState?.sheetName.trim() || ''
+
+  useEffect(() => {
+    let isMounted = true
+
+    void readSessionJobState().then(state => {
+      if (!isMounted) {
+        return
+      }
+
+      setJobState(state)
+
+      if (state) {
+        const hydrated = applyJobState(state)
+        setSheetName(hydrated.sheetName)
+        setQueriesText(hydrated.queriesText)
+        setScrapedData(hydrated.scrapedData)
+      }
+    })
+
+    const handleStorageChange = (
+      changes: Record<string, { oldValue?: unknown; newValue?: unknown }>,
+      areaName: 'session' | 'local',
+    ) => {
+      if (areaName !== 'local' || !changes[JOB_STORAGE_KEY]) {
+        return
+      }
+
+      const nextState = (changes[JOB_STORAGE_KEY].newValue as GoogleMapsScrapeJobState | undefined) ?? null
+      setJobState(nextState)
+
+      if (nextState) {
+        const hydrated = applyJobState(nextState)
+        setSheetName(hydrated.sheetName)
+        setQueriesText(hydrated.queriesText)
+        setScrapedData(hydrated.scrapedData)
+      } else {
+        setScrapedData(null)
+      }
+    }
+
+    chrome.storage.onChanged.addListener(handleStorageChange)
+
+    return () => {
+      isMounted = false
+    }
+  }, [])
 
   async function startScrape() {
     setStatus(null)
-    setActionState('loading-scrape')
+    setActionState('loading-start')
 
     try {
       const activeTab = await queryActiveTab()
@@ -139,35 +175,39 @@ export function Popup() {
         throw new Error('Open a Google Maps page before using this extension.')
       }
 
-      // Extract search query from URL for API/download payload
-      const search = extractSearchFromUrl(activeTab.url)
-      setSearchQuery(search)
+      const queries = parsedQueries
 
-      const scrapeResponse = await requestScrape(activeTab.id, recordLimit)
-
-      if (!scrapeResponse.success) {
-        throw new Error(scrapeResponse.error)
+      if (!sheetName.trim()) {
+        throw new Error('Enter a sheet name before starting automation.')
       }
 
-      // If the response is the all-list form, accept it
-      if (Array.isArray((scrapeResponse as any).data)) {
-        const rows = (scrapeResponse as any).data as ScrapedArray
-
-        if (!rows || rows.length === 0) {
-          throw new Error('The current Google Maps page did not expose any visible business details.')
-        }
-
-        setScrapedData(rows)
-        setStatus({ kind: 'success', message: `Scraped ${rows.length} results.` })
-        return
+      if (!queries.length) {
+        throw new Error('Enter at least one query in the textarea.')
       }
 
-      // Backwards-compatibility: single object response
-      const single = (scrapeResponse as any).data as ScrapedGoogleMapsData
-      if (!single) throw new Error('No data returned from scraper.')
+      const startResponse = await requestStartBatch(activeTab.id, {
+        type: 'SCRIPT_START_BATCH',
+        sheetName: sheetName.trim(),
+        queries,
+      })
 
-      setScrapedData([single])
-      setStatus({ kind: 'success', message: 'Scraped 1 result.' })
+      if (!startResponse.success) {
+        throw new Error(startResponse.error)
+      }
+
+      setJobState({
+        status: 'running',
+        sheetName: sheetName.trim(),
+        queries,
+        totalQueries: queries.length,
+        currentQueryIndex: 0,
+        currentQuery: queries[0] ?? '',
+        completedQueries: 0,
+        results: [],
+        updatedAt: new Date().toISOString(),
+      })
+      setScrapedData(null)
+      setStatus({ kind: 'success', message: `Automation started for ${queries.length} queries.` })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Something went wrong.'
       setStatus({ kind: 'error', message })
@@ -181,15 +221,17 @@ export function Popup() {
     setActionState(action === 'download' ? 'loading-download' : 'loading-api')
 
     try {
-      if (!scrapedData || scrapedData.length === 0) throw new Error('No scraped data available.')
+      const rows = scrapedData ?? jobState?.results ?? []
+
+      if (!rows.length) throw new Error('No scraped data available.')
 
       if (action === 'download') {
-        const filename = downloadJson(scrapedData, searchQuery)
+        const filename = downloadJson(rows, activeSheetName)
         setStatus({ kind: 'success', message: `Downloaded ${filename}.` })
         return
       }
 
-      await postScrapedData(scrapedData, searchQuery)
+      await postScrapedData(rows, activeSheetName)
       setStatus({ kind: 'success', message: 'Scraped data was sent to the API successfully.' })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Something went wrong.'
@@ -200,6 +242,71 @@ export function Popup() {
   }
 
   const isLoading = actionState !== 'idle'
+  const currentQueryNumber = (jobState?.completedQueries ?? 0) + 1
+  const totalQueries = jobState?.totalQueries ?? 0
+  let statusMessage = 'Ready. Open Google Maps, enter your sheet name and queries, then start automation.'
+
+  if (isRunning) {
+    statusMessage = `Running query ${Math.min(currentQueryNumber, totalQueries)} of ${totalQueries}: ${jobState?.currentQuery || 'Preparing…'}`
+  } else if (status) {
+    statusMessage = status.message
+  } else if (jobState?.status === 'completed') {
+    statusMessage = `Completed ${jobState.completedQueries} queries and collected ${jobState.results.length} records.`
+  } else if (jobState?.status === 'error') {
+    statusMessage = jobState.error ?? 'Automation stopped with an error.'
+  }
+
+  const primaryActionButton = isRunning ? (
+    <button type="button" className="primary-button" disabled>
+      Automation running
+    </button>
+  ) : (
+    <button
+      type="button"
+      className="primary-button"
+      onClick={() => void startScrape()}
+      disabled={isLoading}
+    >
+      {actionState === 'loading-start' ? 'Starting…' : 'Start data scrapping'}
+    </button>
+  )
+
+  const completedActionButtons = hasCompletedData && !isRunning ? (
+    <>
+      <button
+        type="button"
+        className="primary-button"
+        onClick={() => void runAction('download')}
+        disabled={isLoading}
+      >
+        {actionState === 'loading-download' ? 'Downloading…' : 'Download JSON'}
+      </button>
+
+      <button
+        type="button"
+        className="secondary-button"
+        onClick={() => void runAction('api')}
+        disabled={isLoading}
+      >
+        {actionState === 'loading-api' ? 'Sending…' : 'Send to API'}
+      </button>
+    </>
+  ) : null
+
+  const statusPanelContent = isLoading && !isRunning ? (
+    <div className="status-loading">
+      <span className="spinner" aria-hidden="true" />
+      <span>
+        {actionState === 'loading-start'
+          ? 'Starting the Google Maps query queue…'
+          : actionState === 'loading-download'
+            ? 'Preparing JSON download…'
+            : 'Sending scraped data…'}
+      </span>
+    </div>
+  ) : (
+    <span>{statusMessage}</span>
+  )
 
   return (
     <main className="popup-shell">
@@ -207,76 +314,40 @@ export function Popup() {
         <div className="popup-header">
           <div className="popup-badge">Google Maps</div>
           <h1>Lead Exporter</h1>
-          <p>Capture visible business details only when you click a button.</p>
+          <p>Queue multiple Maps searches, keep the tab open, and continue even if the popup closes.</p>
         </div>
 
-        {!scrapedData ? (
-          <label className="popup-limit-field">
-            <span>How many records do you want to scrape?</span>
-            <input
-              type="number"
-              min="1"
-              inputMode="numeric"
-              placeholder="Leave blank for all records"
-              value={limitInput}
-              onChange={event => setLimitInput(event.target.value)}
-            />
-            <small>Blank = scrape all loaded records.</small>
-          </label>
-        ) : null}
+        <label className="popup-field">
+          <span>Sheet name</span>
+          <input
+            type="text"
+            placeholder="Enter the sheet name for API search key"
+            value={sheetName}
+            onChange={event => setSheetName(event.target.value)}
+            disabled={isRunning}
+          />
+          <small>This value is used for every API call in the session.</small>
+        </label>
+
+        <label className="popup-field popup-queries-field">
+          <span>Queries</span>
+          <textarea
+            rows={7}
+            placeholder={'One query per line or separated by commas\narenas in lahore\narenas in raiwind, arenas in dha'}
+            value={queriesText}
+            onChange={event => setQueriesText(event.target.value)}
+            disabled={isRunning}
+          />
+          <small>Separate queries with line breaks or commas. Each entry runs as a separate Google Maps search.</small>
+        </label>
 
         <div className="popup-actions">
-          {!scrapedData ? (
-            <button
-              type="button"
-              className="primary-button"
-              onClick={() => void startScrape()}
-              disabled={isLoading}
-            >
-              {actionState === 'loading-scrape' ? 'Scraping…' : 'Start data scrapping'}
-            </button>
-          ) : (
-            <>
-              <button
-                type="button"
-                className="primary-button"
-                onClick={() => void runAction('download')}
-                disabled={isLoading}
-              >
-                {actionState === 'loading-download' ? 'Downloading…' : 'Download JSON'}
-              </button>
-
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={() => void runAction('api')}
-                disabled={isLoading}
-              >
-                {actionState === 'loading-api' ? 'Sending…' : 'Send to API'}
-              </button>
-            </>
-          )}
+          {primaryActionButton}
+          {completedActionButtons}
         </div>
 
         <div className={`status-panel ${status ? status.kind : 'idle'}`} aria-live="polite">
-          {isLoading ? (
-            <div className="status-loading">
-              <span className="spinner" aria-hidden="true" />
-              <span>
-                {actionState === 'loading-scrape'
-                  ? recordLimit
-                    ? `Loading all results and scraping first ${recordLimit} records…`
-                    : 'Loading all results and scraping every record…'
-                  : actionState === 'loading-download'
-                    ? 'Preparing JSON download…'
-                    : 'Sending scraped data…'}
-              </span>
-            </div>
-          ) : status ? (
-            <span>{status.message}</span>
-          ) : (
-            <span>Ready. Open Google Maps, then choose an action.</span>
-          )}
+          {statusPanelContent}
         </div>
       </section>
     </main>

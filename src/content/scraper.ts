@@ -1,10 +1,24 @@
 import type {
-  ScrapeCommandMessage,
+  ApiPostResponse,
   ScrapeResponse,
+  GoogleMapsScrapeJobState,
+  RuntimeMessage,
+  StartBatchScrapeMessage,
   ScrapedGoogleMapsData,
 } from '../types'
 
 const RESULT_CARD_SELECTOR = 'div[role="article"], [role="listitem"], .Nv2PK, .section-result, [data-result-id]'
+const JOB_STORAGE_KEY = 'map-leads-scrape-job'
+const SEARCH_INPUT_SELECTORS = [
+  'div[role="search"] form.NhWQq input[name="q"]',
+  'div[role="search"] input.UGojuc[name="q"]',
+  'div[role="search"] input[name="q"]',
+  'input#searchboxinput',
+  'input[aria-label*="Search Google Maps"]',
+  'input[placeholder*="Search Google Maps"]',
+  'form.NhWQq input[name="q"]',
+  'input.UGojuc[name="q"]',
+]
 const DETAILS_WAIT_TIMEOUT_MS = 2200
 const SCROLL_SETTLE_MS = 180
 const CLICK_SETTLE_MS = 500
@@ -29,6 +43,8 @@ type ScrapeRunStats = {
   lastAcceptedIndex: number
 }
 
+let batchInProgress = false
+
 function logScrape(event: string, details?: unknown) {
   if (typeof details === 'undefined') {
     console.log('[map-leads]', event)
@@ -36,6 +52,245 @@ function logScrape(event: string, details?: unknown) {
   }
 
   console.log('[map-leads]', event, details)
+}
+
+function setSessionValue(key: string, value: unknown) {
+  return new Promise<void>((resolve, reject) => {
+    chrome.storage.local.set({ [key]: value }, () => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message || 'Failed to persist job state.'))
+        return
+      }
+
+      resolve()
+    })
+  })
+}
+
+function updateSessionJobState(nextState: GoogleMapsScrapeJobState) {
+  return setSessionValue(JOB_STORAGE_KEY, nextState)
+}
+
+function findSearchInput() {
+  for (const selector of SEARCH_INPUT_SELECTORS) {
+    const inputs = Array.from(document.querySelectorAll<HTMLInputElement>(selector))
+    const input = inputs.find(candidate => {
+      if (!(candidate instanceof HTMLInputElement)) {
+        return false
+      }
+
+      if (candidate.closest('#directions-searchbox-0, #directions-searchbox-1, .JuLCid, .jcoKVe')) {
+        return false
+      }
+
+      const style = window.getComputedStyle(candidate)
+      if (style.display === 'none' || style.visibility === 'hidden') {
+        return false
+      }
+
+      return true
+    })
+
+    if (input) {
+      return input
+    }
+  }
+
+  return null
+}
+
+function setNativeInputValue(input: HTMLInputElement, value: string) {
+  const descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+  descriptor?.set?.call(input, value)
+}
+
+async function waitForSearchResultsToLoad(timeoutMs = 15000) {
+  const startedAt = Date.now()
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const cards = collectVisibleCardDescriptors()
+    const container = getResultsContainer()
+
+    if (cards.length > 0 && container) {
+      return
+    }
+
+    await sleep(250)
+  }
+
+  throw new Error('Google Maps search results did not load in time.')
+}
+
+async function submitMapsQuery(query: string) {
+  let input = findSearchInput()
+
+  if (!input) {
+    const closeDirectionsButton = document.querySelector<HTMLElement>(
+      'button[aria-label="Close directions"], button[jsaction*="directions.close"]',
+    )
+
+    if (closeDirectionsButton) {
+      closeDirectionsButton.click()
+      await sleep(350)
+      input = findSearchInput()
+    }
+  }
+
+  if (!input) {
+    throw new Error('Google Maps search input was not found. Make sure the Maps page is open and visible.')
+  }
+
+  input.focus()
+  input.select()
+  setNativeInputValue(input, query)
+  input.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }))
+  input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }))
+  input.dispatchEvent(
+    new KeyboardEvent('keydown', {
+      key: 'Enter',
+      code: 'Enter',
+      bubbles: true,
+      cancelable: true,
+    }),
+  )
+  input.dispatchEvent(
+    new KeyboardEvent('keyup', {
+      key: 'Enter',
+      code: 'Enter',
+      bubbles: true,
+      cancelable: true,
+    }),
+  )
+
+  const searchButton =
+    document.querySelector<HTMLElement>('div[role="search"] button[aria-label="Search"]') ??
+    document.querySelector<HTMLElement>('button#searchbox-searchbutton') ??
+    input.closest('form')?.parentElement?.querySelector<HTMLElement>('button[aria-label="Search"]') ??
+    null
+  searchButton?.click()
+
+  await sleep(800)
+  await waitForSearchResultsToLoad()
+  await sleep(400)
+}
+
+function requestApiPost(data: ScrapedGoogleMapsData[], sheetName: string, query: string) {
+  return new Promise<ApiPostResponse>((resolve, reject) => {
+    const message: RuntimeMessage = {
+      type: 'SCRIPT_POST_RESULTS',
+      sheetName,
+      query,
+      data,
+    }
+
+    chrome.runtime.sendMessage(message, response => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message || 'API relay is unavailable.'))
+        return
+      }
+
+      resolve(response as ApiPostResponse)
+    })
+  })
+}
+
+function buildRunningState(
+  sheetName: string,
+  queries: string[],
+  currentQueryIndex: number,
+  currentQuery: string,
+  completedQueries: number,
+  results: ScrapedGoogleMapsData[],
+  error?: string,
+): GoogleMapsScrapeJobState {
+  return {
+    status: error ? 'error' : completedQueries >= queries.length && queries.length > 0 ? 'completed' : 'running',
+    sheetName,
+    queries,
+    totalQueries: queries.length,
+    currentQueryIndex,
+    currentQuery,
+    completedQueries,
+    results,
+    error,
+    updatedAt: new Date().toISOString(),
+  }
+}
+
+async function runQueuedMapsScrape(message: StartBatchScrapeMessage) {
+  if (batchInProgress) {
+    throw new Error('A scraping session is already running in this tab.')
+  }
+
+  const sheetName = message.sheetName.trim()
+  const queries = message.queries.map(query => query.trim()).filter(Boolean)
+
+  if (!sheetName) {
+    throw new Error('Enter a sheet name before starting the automation.')
+  }
+
+  if (!queries.length) {
+    throw new Error('Enter at least one Google Maps query.')
+  }
+
+  batchInProgress = true
+
+  const collectedRows: ScrapedGoogleMapsData[] = []
+  const seenRows = new Set<string>()
+  let completedQueries = 0
+  let currentQueryIndex = 0
+  let currentQuery = queries[0] ?? ''
+
+  try {
+    await updateSessionJobState(buildRunningState(sheetName, queries, 0, queries[0], 0, []))
+
+    for (let index = 0; index < queries.length; index += 1) {
+      currentQueryIndex = index
+      currentQuery = queries[index]
+      await updateSessionJobState(buildRunningState(sheetName, queries, index, currentQuery, completedQueries, collectedRows))
+
+      await submitMapsQuery(currentQuery)
+
+      const rows = (await scrapeAllLoadedRecords()).filter(row => isRealPlaceName(row.name))
+
+      for (const row of rows) {
+        const rowSignature = `${row.name}||${row.address}||${row.phone}`
+        if (seenRows.has(rowSignature)) {
+          continue
+        }
+
+        seenRows.add(rowSignature)
+        collectedRows.push(row)
+      }
+
+      const apiResponse = await requestApiPost(rows, sheetName, currentQuery)
+      if (!apiResponse.success) {
+        throw new Error(apiResponse.error)
+      }
+
+      completedQueries = index + 1
+      await updateSessionJobState(buildRunningState(sheetName, queries, index + 1, currentQuery, completedQueries, collectedRows))
+    }
+
+    await updateSessionJobState({
+      status: 'completed',
+      sheetName,
+      queries,
+      totalQueries: queries.length,
+      currentQueryIndex: Math.max(queries.length - 1, 0),
+      currentQuery: queries[queries.length - 1] ?? '',
+      completedQueries: queries.length,
+      results: collectedRows,
+      updatedAt: new Date().toISOString(),
+    })
+  } catch (error) {
+    const messageText = error instanceof Error ? error.message : 'Failed to complete the query queue.'
+
+    await updateSessionJobState(buildRunningState(sheetName, queries, currentQueryIndex, currentQuery, completedQueries, collectedRows, messageText))
+    throw error
+  } finally {
+    batchInProgress = false
+  }
 }
 
 function summarizeRunStats(stats: ScrapeRunStats, totalResults: number) {
@@ -577,7 +832,17 @@ async function scrapeAllLoadedRecords(limit?: number | null) {
   return results
 }
 
-async function handleScrapeRequest(message: ScrapeCommandMessage, sendResponse: (response: ScrapeResponse) => void) {
+async function handleScrapeRequest(message: RuntimeMessage, sendResponse: (response: ScrapeResponse | { success: true; started: true } | { success: false; error: string }) => void) {
+  if (message.type === 'SCRIPT_START_BATCH') {
+    sendResponse({ success: true, started: true })
+
+    void runQueuedMapsScrape(message).catch(error => {
+      logScrape('queued scrape failed', error)
+    })
+
+    return
+  }
+
   if (message.type !== 'SCRIPT_SCRAPE' && message.type !== 'SCRIPT_START_SCRAPE') {
     sendResponse({ success: false, error: 'Unsupported message type.' })
     return
@@ -599,6 +864,6 @@ async function handleScrapeRequest(message: ScrapeCommandMessage, sendResponse: 
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  void handleScrapeRequest(message as ScrapeCommandMessage, sendResponse)
+  void handleScrapeRequest(message as RuntimeMessage, sendResponse)
   return true
 })
