@@ -30,6 +30,52 @@ export type ScrapeErrorResponse = {
 
 export type ScrapeResponse = ScrapeSuccessResponse | ScrapeAllSuccessResponse | ScrapeErrorResponse
 
+export type StartBatchScrapeMessage = {
+  type: 'SCRIPT_START_BATCH'
+  sheetName: string
+  queries: string[]
+}
+
+export type PostResultsMessage = {
+  type: 'SCRIPT_POST_RESULTS'
+  sheetName: string
+  query: string
+  data: ScrapedGoogleMapsData[]
+}
+
+export type StartBatchAckResponse = {
+  success: true
+  started: true
+}
+
+export type ApiPostSuccessResponse = {
+  success: true
+}
+
+export type ApiPostErrorResponse = {
+  success: false
+  error: string
+}
+
+export type ApiPostResponse = ApiPostSuccessResponse | ApiPostErrorResponse
+
+export type RuntimeMessage = ScrapeCommandMessage | StartBatchScrapeMessage | PostResultsMessage
+
+export type RuntimeResponse = ScrapeResponse | StartBatchAckResponse | ApiPostResponse
+
+export type GoogleMapsScrapeJobState = {
+  status: 'idle' | 'running' | 'completed' | 'error'
+  sheetName: string
+  queries: string[]
+  totalQueries: number
+  currentQueryIndex: number
+  currentQuery: string
+  completedQueries: number
+  results: ScrapedGoogleMapsData[]
+  error?: string
+  updatedAt: string
+}
+
 export type ScrapeCommandMessage = {
   type: 'SCRIPT_SCRAPE' | 'SCRIPT_START_SCRAPE'
   limit?: number | null
@@ -47,19 +93,40 @@ export type ChromeTabsApi = {
   ): void
   sendMessage(
     tabId: number,
-    message: ScrapeCommandMessage,
-    callback: (response: ScrapeResponse) => void,
+    message: RuntimeMessage,
+    callback: (response: RuntimeResponse) => void,
   ): void
 }
 
+export type ChromeStorageArea = {
+  get(keys: string | string[] | null, callback: (items: Record<string, unknown>) => void): void
+  set(items: Record<string, unknown>, callback?: () => void): void
+  remove(keys: string | string[], callback?: () => void): void
+  clear(callback?: () => void): void
+}
+
+export type ChromeStorageApi = {
+  session: ChromeStorageArea
+  local: ChromeStorageArea
+  onChanged: {
+    addListener(
+      callback: (
+        changes: Record<string, { oldValue?: unknown; newValue?: unknown }>,
+        areaName: 'session' | 'local',
+      ) => void,
+    ): void
+  }
+}
+
 export type ChromeRuntimeApi = {
+  sendMessage(message: RuntimeMessage, callback: (response: RuntimeResponse) => void): void
   lastError?: { message?: string }
   onMessage: {
     addListener(
       callback: (
-        message: ScrapeCommandMessage,
+        message: RuntimeMessage,
         sender: unknown,
-        sendResponse: (response: ScrapeResponse) => void,
+        sendResponse: (response: RuntimeResponse) => void,
       ) => boolean | void,
     ): void
   }
@@ -87,6 +154,7 @@ export type ChromeExtension = {
   runtime: ChromeRuntimeApi
   downloads: ChromeDownloadsApi
   action: ChromeActionApi
+  storage: ChromeStorageApi
 }
 
 export {}

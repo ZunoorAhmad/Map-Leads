@@ -20,7 +20,7 @@ const manifest = {
       128: 'icons/icon.svg',
     },
   },
-  permissions: ['activeTab', 'scripting', 'downloads'],
+  permissions: ['activeTab', 'scripting', 'downloads', 'storage'],
   host_permissions: mapsHostPermissions,
   content_scripts: [
     {
